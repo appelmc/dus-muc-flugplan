@@ -1,0 +1,27 @@
+name: Set Pages Source
+
+# Einmaliger Hilfs-Workflow: stellt die Pages-Quelle auf Branch main / um.
+# Nutzt den workflow-eigenen Token (permissions: pages), nicht den PAT.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  pages: write
+  contents: read
+
+jobs:
+  set-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pages-Quelle auf main / setzen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "--- vorher ---"
+          gh api repos/${{ github.repository }}/pages --jq '{source, build_type, status}' || true
+          echo "--- PUT ---"
+          gh api -X PUT repos/${{ github.repository }}/pages \
+            -f source[branch]=main -f source[path]=/ --jq '{source, build_type, status}'
+          echo "--- nachher ---"
+          gh api repos/${{ github.repository }}/pages --jq '{source, build_type, status}'
