@@ -51,10 +51,18 @@ jobs:
           git add dus-muc.ics
           if git diff --cached --quiet; then
             echo "Keine Aenderungen - Feed ist aktuell."
-          else
-            git commit -m "Flugplan aktualisiert ($(date -u +%Y-%m-%dT%H:%MZ))"
-            # Falls waehrend des Laufs ein weiterer Commit kam: erst nachziehen,
-            # sonst wird der Push abgelehnt (Fehlerbild: roter Lauf beim Schreiben).
-            git pull --rebase --autostash origin main
-            git push
+            exit 0
           fi
+          # Der Feed wird erzeugt, nicht gepflegt: der neue Stand soll den alten
+          # ersetzen, nicht mit einem fremden verschmolzen werden. Deshalb den
+          # eigenen Stand auf die aktuelle Spitze von origin/main setzen statt zu
+          # rebasen. Ein Rebase scheiterte bisher mit "could not apply ..." und
+          # machte den Lauf rot, obwohl der Feed fertig gebaut war.
+          git fetch origin main
+          git reset --soft origin/main
+          if git diff --cached --quiet; then
+            echo "Keine Aenderungen - der neue Feed entspricht bereits origin/main."
+            exit 0
+          fi
+          git commit -m "Flugplan aktualisiert ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push origin HEAD:main

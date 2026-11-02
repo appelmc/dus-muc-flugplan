@@ -36,6 +36,7 @@ import pathlib
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -50,6 +51,13 @@ CONFIRM_DAYS = 14              # gegen die Muenchner Tafel gepruefter Nahbereich
 CONFIRMED_MARK = "✅"
 SEITE = 1000                   # Datensätze je API-Abruf
 MAX_SEITEN = 40                # Sicherung gegen Endlosschleifen beim Blaettern
+
+# Zweitquelle Muenchner Tafel: Abrufabstand, Wiederholung und Ausdauer.
+MUC_PAUSE = 2.5                # Sekunden zwischen zwei Abrufen der Tafel
+MUC_VERSUCHE = 2               # hoechstens zwei Versuche je Tagesabruf
+MUC_RETRY_PAUSE = 30.0         # erste Wartezeit vor dem Wiederholungsversuch
+MUC_RETRY_PAUSE_MAX = 120.0    # Obergrenze dieser Wartezeit
+MUC_ZEITBUDGET = 300.0         # Sekunden fuer die gesamte Gegenprobe-Stufe
 
 # Flugtafel des Flughafens Muenchen (Zweitquelle, kein Schluessel noetig).
 MUC_BOARD = "https://www.munich-airport.com/flightsearch/{direction}"
@@ -217,19 +225,46 @@ def muc_opener() -> urllib.request.OpenerDirector:
     return op
 
 
-def muc_day(direction: str, day: dt.date, opener: urllib.request.OpenerDirector) -> str:
-    """Eine Tagesansicht der Muenchner Flugtafel ('arrivals'/'departures')."""
+def _muc_tag_url(direction: str, day: dt.date) -> str:
     tag = day.isoformat()
-    url = (MUC_BOARD.format(direction=direction)
-           + f"?from={tag}T00:00:00&allow_scroll_back=1&allow_pagination=1"
-           + f"&min_date={tag}T00:00:00&max_date={tag}T23:59:59&per_page=2000&page=0")
-    req = urllib.request.Request(url, headers=MUC_HEADERS)
-    try:
-        with opener.open(req, timeout=120) as r:
-            return r.read().decode("utf-8", "replace")
-    except Exception:                                   # noqa: BLE001
-        with muc_opener().open(req, timeout=120) as r:   # Sitzung neu aufbauen
-            return r.read().decode("utf-8", "replace")
+    return (MUC_BOARD.format(direction=direction)
+            + f"?from={tag}T00:00:00&allow_scroll_back=1&allow_pagination=1"
+            + f"&min_date={tag}T00:00:00&max_date={tag}T23:59:59&per_page=2000&page=0")
+
+
+def muc_day(direction: str, day: dt.date, opener: urllib.request.OpenerDirector,
+            retry_pause: float = MUC_RETRY_PAUSE, *,
+            opener_factory=muc_opener) -> tuple[str | None, str, float]:
+    """Eine Tagesansicht der Muenchner Tafel ('arrivals'/'departures').
+
+    Der Abruf wird bis zu ``MUC_VERSUCHE`` mal versucht; zwischen den Versuchen
+    wird ``retry_pause`` Sekunden gewartet. Nach einem erneuten HTTP 403
+    verdoppelt sich diese Wartezeit (hoechstens bis ``MUC_RETRY_PAUSE_MAX``),
+    damit eine IP-Sperre nicht in eine Abrufschleife laeuft.
+
+    Rueckgabe: (html | None, Fehlerbeschreibung, naechste Wartezeit). ``html``
+    ist None, wenn alle Versuche scheiterten; die Fehlerbeschreibung nennt die
+    Ursache im Klartext, zum Beispiel ``"HTTP 403"``.
+    """
+    req = urllib.request.Request(_muc_tag_url(direction, day), headers=MUC_HEADERS)
+    letzter = ""
+    for versuch in range(MUC_VERSUCHE):
+        if versuch:
+            time.sleep(retry_pause)
+            if letzter.startswith("HTTP 403"):
+                retry_pause = min(retry_pause * 2, MUC_RETRY_PAUSE_MAX)
+        try:
+            with opener.open(req, timeout=120) as r:
+                return r.read().decode("utf-8", "replace"), "", retry_pause
+        except urllib.error.HTTPError as exc:
+            letzter = f"HTTP {exc.code}"
+        except Exception as exc:                        # noqa: BLE001
+            letzter = f"{type(exc).__name__}: {exc}"
+        try:
+            opener = opener_factory()                   # Sitzung neu aufbauen
+        except Exception:                               # noqa: BLE001
+            pass
+    return None, letzter, retry_pause
 
 
 def parse_muc_board(seite: str, farbcode: str = "DUS") -> list[dict]:
@@ -253,11 +288,20 @@ def parse_muc_board(seite: str, farbcode: str = "DUS") -> list[dict]:
     return out
 
 
-def confirm_against_muc(flights: list[dict], days: int) -> tuple[set, dict, str]:
+def confirm_against_muc(flights: list[dict], days: int, *,
+                        opener_factory=muc_opener, pause: float = MUC_PAUSE,
+                        retry_pause: float = MUC_RETRY_PAUSE,
+                        budget: float = MUC_ZEITBUDGET) -> tuple[set, dict, str]:
     """Gegenprobe: Fluege, die auch auf der Muenchner Tafel stehen.
 
-    Gibt (Schluessel, Zusatzinfos, Hinweis) zurueck. Bei Fehlern bleibt die
-    Menge leer - es wird nie ein Flug faelschlich markiert.
+    Gibt (Schluessel, Zusatzinfos, Hinweis) zurueck. Fehlgeschlagene Abrufe
+    lassen die Menge unvollstaendig - es wird nie ein Flug faelschlich
+    markiert. Der Hinweis benennt eine Sperre im Klartext, damit im Protokoll
+    unterscheidbar bleibt, ob die Tafel nichts hergab oder gar nicht
+    antwortete.
+
+    ``opener_factory``, ``pause`` und ``retry_pause`` sind fuer den Selbsttest
+    austauschbar; im Betrieb gelten die Modulkonstanten.
     """
     if days <= 0:
         return set(), {}, "Stufe abgeschaltet"
@@ -267,26 +311,46 @@ def confirm_against_muc(flights: list[dict], days: int) -> tuple[set, dict, str]
     tage = [t for t in tage if heute <= dt.date.fromisoformat(t) <= grenze]
     bestaetigt: set = set()
     zusatz: dict = {}
-    fehler: list[str] = []
+    gruende: collections.Counter = collections.Counter()
+    abrufe = fehlgeschlagen = uebersprungen = 0
+    start = time.monotonic()
     try:
-        opener = muc_opener()
+        opener = opener_factory()
     except Exception as exc:                            # noqa: BLE001
         return set(), {}, f"Muenchner Tafel nicht erreichbar ({exc})"
     for tag in tage:
         d = dt.date.fromisoformat(tag)
         for direction, von, nach in (("arrivals", "DUS", "MUC"), ("departures", "MUC", "DUS")):
-            try:
-                for z in parse_muc_board(muc_day(direction, d, opener)):
+            if abrufe and time.monotonic() - start > budget:
+                uebersprungen += 1
+                continue
+            seite, fehler, retry_pause = muc_day(direction, d, opener, retry_pause,
+                                                 opener_factory=opener_factory)
+            abrufe += 1
+            if seite is None:
+                fehlgeschlagen += 1
+                gruende[fehler or "unbekannter Fehler"] += 1
+            else:
+                for z in parse_muc_board(seite):
                     num = flight_number_key(z["flight"])
                     if not num:
                         continue
                     key = (tag, von, nach, num)
                     bestaetigt.add(key)
                     zusatz[key] = {"aircraft": z["aircraft"], "times": z["times"]}
-            except Exception as exc:                    # noqa: BLE001
-                fehler.append(f"{direction} {tag}: {exc}")
-            time.sleep(0.4)
-    return bestaetigt, zusatz, ("; ".join(fehler) if fehler else "")
+            time.sleep(pause)
+    gesamt = len(tage) * 2
+    if not fehlgeschlagen and not uebersprungen:
+        return bestaetigt, zusatz, ""
+    if len(gruende) == 1:
+        teile = next(iter(gruende))
+    else:
+        teile = ", ".join(f"{n}x {g}" for g, n in gruende.most_common()) or "kein Abruf"
+    hinweis = (f"MUC-Tafel: {fehlgeschlagen} von {gesamt} Tagesabrufen nicht abrufbar "
+               f"({teile}) - keine Markierung")
+    if uebersprungen:
+        hinweis += f"; {uebersprungen} wegen Zeitbudget uebersprungen"
+    return bestaetigt, zusatz, hinweis
 
 
 # --- ICS-Aufbau -------------------------------------------------------------
@@ -473,7 +537,9 @@ def main() -> int:
 
     confirmed, zusatz, hinweis = confirm_against_muc(flights, args.confirm_days)
     print(f"Gegenprobe Muenchen: {len(confirmed)} Fluege der Muenchner Tafel im "
-          f"{args.confirm_days}-Tage-Fenster." + (f" Hinweis: {hinweis}" if hinweis else ""))
+          f"{args.confirm_days}-Tage-Fenster.")
+    if hinweis:
+        print(f"  {hinweis}")
 
     ics = build_ics(flights, keep_past=args.keep_past, confirmed=confirmed, zusatz=zusatz,
                     mark=args.marker)

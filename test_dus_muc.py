@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import urllib.error
 
 spec = importlib.util.spec_from_file_location("m", "build_dus_ics.py")
 m = importlib.util.module_from_spec(spec)
@@ -89,4 +90,78 @@ assert anzahl == 1, "es haette genau der Vortag uebernommen werden muessen"
 assert f"{gestern}-DUSMUC-LH2004" in erg and f"{vorwoche}-DUSMUC-LH2008" not in erg
 assert erg.count(f"UID:{HEUTE}-DUSMUC-LH2006") == 1 and erg.count("END:VEVENT") == 2
 print("OK: Vortag bleibt, Aelteres fliegt raus, nichts doppelt.")
+
+# --- MUC-Tafel: Fehlerklassifikation und ein Wiederholungsversuch ------------
+class _FehlendeSitzung:
+    """Sitzung, deren Abruf mit einem HTTP-Fehler endet (z. B. IP-Sperre)."""
+
+    def __init__(self, code):
+        self.code, self.aufrufe = code, 0
+
+    def open(self, req, timeout=None):
+        self.aufrufe += 1
+        raise urllib.error.HTTPError(req.full_url, self.code, "Fehler", None, None)
+
+
+class _Antwort:
+    """Minimalantwort mit lesbarem Rumpf, als Kontextmanager nutzbar."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def read(self):
+        return self._text.encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _StilleSitzung:
+    """Sitzung, die immer eine leere Seite liefert (Leerlauf, kein Fehler)."""
+
+    def open(self, req, timeout=None):
+        return _Antwort("<html></html>")
+
+
+class _FlattrigeSitzung:
+    """Erster Abruf scheitert, der Wiederholungsversuch liefert die Seite."""
+
+    def __init__(self, text):
+        self._text, self.aufrufe = text, 0
+
+    def open(self, req, timeout=None):
+        self.aufrufe += 1
+        if self.aufrufe == 1:
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", None, None)
+        return _Antwort(self._text)
+
+
+sitzung = _FehlendeSitzung(403)
+seite, fehler, pause = m.muc_day("arrivals", HEUTE, sitzung, 0.01,
+                                 opener_factory=lambda: sitzung)
+assert seite is None and fehler == "HTTP 403" and sitzung.aufrufe == 2, (seite, fehler, sitzung.aufrufe)
+assert pause == 0.02, f"Wartezeit wurde nach erneutem 403 nicht verdoppelt: {pause}"
+print("OK: 403 wird als 'HTTP 403' gemeldet, genau ein Wiederholungsversuch, Wartezeit verdoppelt.")
+
+flattrig = _FlattrigeSitzung("<html><tr class=\"fp-flight-item\">(DUS)</tr></html>")
+seite, fehler, pause = m.muc_day("departures", HEUTE, flattrig, 0.01,
+                                 opener_factory=lambda: flattrig)
+assert seite is not None and fehler == "" and flattrig.aufrufe == 2, (seite, fehler, flattrig.aufrufe)
+print("OK: ein voruebergehender Fehler wird durch den Wiederholungsversuch geheilt.")
+
+zwei_tage = [{"date": HEUTE.isoformat()}, {"date": (HEUTE + dt.timedelta(days=1)).isoformat()}]
+best, _, hinweis = m.confirm_against_muc(
+    zwei_tage, 2, opener_factory=lambda: _FehlendeSitzung(403), pause=0.0, retry_pause=0.0)
+erwartet = "MUC-Tafel: 4 von 4 Tagesabrufen nicht abrufbar (HTTP 403) - keine Markierung"
+assert best == set() and hinweis == erwartet, hinweis
+print("OK: die Sperre steht im Protokoll als", f"'{hinweis}'")
+
+best, _, hinweis = m.confirm_against_muc(
+    zwei_tage, 2, opener_factory=_StilleSitzung, pause=0.0, retry_pause=0.0)
+assert best == set() and hinweis == "", hinweis
+print("OK: ein leerer Tag gilt nicht als Sperre (kein Fehlerhinweis, keine Markierung).")
+
 print("\nAlle Tests bestanden.")
