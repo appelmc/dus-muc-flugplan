@@ -2,9 +2,13 @@ name: Set Pages Source
 
 # Einmaliger Hilfs-Workflow: stellt die Pages-Quelle auf Branch main / um.
 # Nutzt den workflow-eigenen Token (permissions: pages), nicht den PAT.
+# Wird nach erfolgreicher Nutzung wieder entfernt.
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/_set-pages-source.yml'
 
 permissions:
   pages: write
