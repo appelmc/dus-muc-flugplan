@@ -1,0 +1,60 @@
+name: DUS-MUC Flugplan
+
+# Erzeugt den Kalender-Feed (dus-muc.ics) neu und legt ihn ins Repository.
+# GitHub Pages liefert ihn danach als oeffentliche URL aus.
+
+on:
+  schedule:
+    - cron: "23 4 * * *" # taeglich 04:23 UTC = 06:23 MESZ / 05:23 MEZ
+  workflow_dispatch: # erlaubt den manuellen Start ueber den "Run workflow"-Knopf
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # noetig, damit der Job den Feed zurueck ins Repo schreiben darf
+
+concurrency:
+  group: dus-muc-feed
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Selbsttest (ohne Netz)
+        run: python test_dus_muc.py
+
+      - name: Flugplan abrufen und ICS bauen
+        run: python build_dus_ics.py --out dus-muc.ics
+
+      - name: Feed pruefen
+        run: |
+          count=$(grep -c 'BEGIN:VEVENT' dus-muc.ics || true)
+          echo "Events im Feed: $count"
+          if [ "$count" -lt 20 ]; then
+            echo "::error::Zu wenige Events - die Quelle hat sich vermutlich geaendert. Nichts wird ueberschrieben."
+            exit 1
+          fi
+
+      - name: ICS ins Repository schreiben
+        run: |
+          git config user.name  "dus-muc-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dus-muc.ics
+          if git diff --cached --quiet; then
+            echo "Keine Aenderungen - Feed ist aktuell."
+          else
+            git commit -m "Flugplan aktualisiert ($(date -u +%Y-%m-%dT%H:%MZ))"
+            # Falls waehrend des Laufs ein weiterer Commit kam: erst nachziehen,
+            # sonst wird der Push abgelehnt (Fehlerbild: roter Lauf beim Schreiben).
+            git pull --rebase --autostash origin main
+            git push
+          fi
