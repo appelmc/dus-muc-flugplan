@@ -53,12 +53,17 @@ jobs:
             echo "Keine Aenderungen - Feed ist aktuell."
             exit 0
           fi
+          git fetch origin main
+          # Waechter: hat sich origin/main waehrend des Laufs ausserhalb des Feeds geaendert?
+          if ! git diff --quiet origin/main -- . ':(exclude)dus-muc.ics'; then
+            echo "::error::origin/main hat sich waehrend des Laufs geaendert (andere Dateien) - nichts wird geschrieben, naechster Lauf uebernimmt."
+            exit 1
+          fi
           # Der Feed wird erzeugt, nicht gepflegt: der neue Stand soll den alten
           # ersetzen, nicht mit einem fremden verschmolzen werden. Deshalb den
           # eigenen Stand auf die aktuelle Spitze von origin/main setzen statt zu
           # rebasen. Ein Rebase scheiterte bisher mit "could not apply ..." und
           # machte den Lauf rot, obwohl der Feed fertig gebaut war.
-          git fetch origin main
           git reset --soft origin/main
           if git diff --cached --quiet; then
             echo "Keine Aenderungen - der neue Feed entspricht bereits origin/main."
